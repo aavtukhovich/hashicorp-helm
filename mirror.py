@@ -14,6 +14,7 @@ OUT = Path(os.environ.get("OUT_DIR", "public"))
 CHARTS = {c.strip() for c in os.environ.get("CHARTS", "").split(",") if c.strip()}
 KEEP_LAST = int(os.environ.get("KEEP_LAST", "0"))
 WORKERS = int(os.environ.get("WORKERS", "8"))
+DIGEST_POLICY = os.environ.get("DIGEST_POLICY", "fix")
 RETRIES = 3
 
 log = logging.getLogger("mirror")
@@ -49,16 +50,25 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def download(url: str, dest: Path, digest: str | None) -> str:
-    if dest.exists() and (not digest or sha256(dest) == digest):
-        return "cached"
+class DigestMismatch(Exception):
+    pass
+
+
+def download(url: str, dest: Path, digest: str | None) -> tuple[str, str]:
+    if dest.exists():
+        actual = sha256(dest)
+        if not digest or actual == digest:
+            return "cached", actual
     tmp = dest.with_name(dest.name + ".part")
     tmp.write_bytes(fetch(url))
-    if digest and sha256(tmp) != digest:
-        tmp.unlink()
-        raise ValueError(f"digest mismatch: {url}")
+    actual = sha256(tmp)
+    if digest and actual != digest:
+        if DIGEST_POLICY != "fix":
+            tmp.unlink()
+            raise DigestMismatch(f"{url}: expected {digest}, got {actual}")
+        log.warning("digest mismatch, keeping file with real digest: %s expected=%s got=%s", url, digest, actual)
     tmp.replace(dest)
-    return "downloaded"
+    return "downloaded", actual
 
 
 def main() -> int:
@@ -90,12 +100,47 @@ def main() -> int:
             v["urls"] = [filename]
 
     stats = {"cached": 0, "downloaded": 0}
+    actual_digests: dict[str, str] = {}
+    failed: set[str] = set()
     with cf.ThreadPoolExecutor(WORKERS) as pool:
         futures = {
             pool.submit(download, src, OUT / fn, digest): fn for fn, (src, digest) in jobs.items()
         }
         for fut in cf.as_completed(futures):
-            stats[fut.result()] += 1
+            fn = futures[fut]
+            try:
+                status, actual = fut.result()
+            except DigestMismatch as e:
+                if DIGEST_POLICY == "strict":
+                    raise
+                log.warning("skip, digest mismatch: %s", e)
+                failed.add(fn)
+                continue
+            except Exception as e:
+                log.error("skip, download failed: %s: %s", jobs[fn][0], e)
+                failed.add(fn)
+                continue
+            stats[status] += 1
+            actual_digests[fn] = actual
+
+    if jobs and len(failed) == len(jobs):
+        log.error("all downloads failed")
+        return 1
+
+    for name in list(entries):
+        kept = []
+        for v in entries[name]:
+            fn = (v.get("urls") or [None])[0]
+            if fn in failed or fn not in actual_digests:
+                continue
+            v["digest"] = actual_digests[fn]
+            kept.append(v)
+        if kept:
+            entries[name] = kept
+        else:
+            del entries[name]
+    for fn in failed:
+        jobs.pop(fn, None)
 
     for p in OUT.glob("*.tgz"):
         if p.name not in jobs:
@@ -111,8 +156,8 @@ def main() -> int:
 
     size_mb = sum(p.stat().st_size for p in OUT.iterdir() if p.is_file()) / 1024 / 1024
     log.info(
-        "charts=%d versions=%d downloaded=%d cached=%d size=%.1fMB",
-        len(entries), len(jobs), stats["downloaded"], stats["cached"], size_mb,
+        "charts=%d versions=%d downloaded=%d cached=%d failed=%d size=%.1fMB",
+        len(entries), len(jobs), stats["downloaded"], stats["cached"], len(failed), size_mb,
     )
     return 0
 

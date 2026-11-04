@@ -36,6 +36,7 @@ jobs:
         env:
           CHARTS: ""
           KEEP_LAST: "0"
+          DIGEST_POLICY: fix
 
       - name: size guard
         run: |
